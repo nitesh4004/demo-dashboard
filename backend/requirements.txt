@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+pystac-client
+planetary-computer
+rasterio
+numpy
+pandas
+pyarrow
+scikit-learn
+scipy
+pillow
+requests
