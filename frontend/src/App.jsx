@@ -906,6 +906,16 @@ function App() {
   const [floodSwipeDragging, setFloodSwipeDragging] = useState(false);
   const [floodShowMask, setFloodShowMask] = useState(true);
 
+  // Evapotranspiration (SEBAL) States — Landsat-9 + ERA5-Land (CDS).
+  // analysisMode "et" = single-date map, "et_timeseries" = seasonal trend.
+  const [etSingleResult, setEtSingleResult] = useState(null);
+  const [etSeriesResult, setEtSeriesResult] = useState(null);
+  const [etLoading, setEtLoading] = useState(false);
+  const [etMaxScenes, setEtMaxScenes] = useState(6);      // hard-capped at 8 server-side
+  const [etPalette, setEtPalette] = useState("ET (Dry-Wet)");
+  const [etVisMin, setEtVisMin] = useState("");
+  const [etVisMax, setEtVisMax] = useState("");
+
   // Dynamic Overlay Resize states
   const [resultsWidth, setResultsWidth] = useState(320);
   const [isResizing, setIsResizing] = useState(false);
@@ -2198,6 +2208,8 @@ function App() {
     setAefResult(null);
     setSimilarityResult(null);
     setFloodResult(null);
+    setEtSingleResult(null);
+    setEtSeriesResult(null);
     setQueryGeometry(null);
     setQueryFileName("");
     setCustomClusterNames({});
@@ -2354,6 +2366,127 @@ function App() {
       showToast(e.message, true);
     } finally {
       setTimeSeriesLoading(false);
+      setLoading(false);
+    }
+  };
+
+  // Evapotranspiration (SEBAL) — single-date actual ET (mm/day) for one Landsat-9
+  // scene, using ERA5-Land overpass meteorology from Copernicus CDS.
+  const runEtSingle = async () => {
+    if (!selectedSceneId) {
+      showToast("Query and select a Landsat-9 scene first.", true);
+      return;
+    }
+    setEtLoading(true);
+    setLoading(true);
+    setLoadingText("Running SEBAL energy balance — fetching ERA5-Land from CDS (can take a minute)...");
+    setEtSingleResult(null);
+    try {
+      const payload = {
+        item_id: selectedSceneId,
+        bbox: [minLon, minLat, maxLon, maxLat],
+        palette: etPalette,
+        vis_min: etVisMin !== "" ? parseFloat(etVisMin) : null,
+        vis_max: etVisMax !== "" ? parseFloat(etVisMax) : null,
+        geometry: uploadedGeoJson
+      };
+      const res = await fetch(`${API_BASE}/api/et/single`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "SEBAL evapotranspiration failed");
+      }
+      const data = await res.json();
+      setEtSingleResult(data);
+      if (data.vis_min != null) setEtVisMin(data.vis_min.toFixed(2));
+      if (data.vis_max != null) setEtVisMax(data.vis_max.toFixed(2));
+      renderRasterOverlay(data.image_url, data.bbox || [minLon, minLat, maxLon, maxLat]);
+      setResultsPanelOpen(true);
+      showToast(`ET map ready for ${data.date} (mean ${(data.stats?.mean ?? 0).toFixed(2)} mm/day)`);
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
+      setEtLoading(false);
+      setLoading(false);
+    }
+  };
+
+  // Evapotranspiration (SEBAL) — seasonal ETa trend across Landsat-9 scenes.
+  // Each date triggers a separate (slow) ERA5-Land retrieval, so scenes are capped.
+  const runEtSeries = async () => {
+    if (roiMethod === "file" && !uploadedGeoJson) {
+      showToast("Upload a vector file first or choose Draw to select ROI.", true);
+      return;
+    }
+    setEtLoading(true);
+    setLoading(true);
+    setLoadingText("Computing SEBAL ET per scene — each date fetches ERA5-Land from CDS; this can take a few minutes...");
+    setEtSeriesResult(null);
+    try {
+      const payload = {
+        bbox: [minLon, minLat, maxLon, maxLat],
+        start_date: startDate,
+        end_date: endDate,
+        geometry: uploadedGeoJson,
+        max_scenes: etMaxScenes
+      };
+      const res = await fetch(`${API_BASE}/api/et/time-series`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "ET time series failed");
+      }
+      const data = await res.json();
+      if (!data.timeseries || data.timeseries.length === 0) {
+        throw new Error("No Landsat-9 scenes could be processed in the selected range.");
+      }
+      setEtSeriesResult(data);
+      setResultsPanelOpen(true);
+      const skipped = (data.skipped || []).length;
+      showToast(`ET trend ready: ${data.timeseries.length} scene(s)` + (skipped ? `, ${skipped} skipped` : ""));
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
+      setEtLoading(false);
+      setLoading(false);
+    }
+  };
+
+  // Render the SEBAL ET map for one scene picked from the trend table.
+  const loadSpecificEtScene = async (sceneId, date) => {
+    setLoading(true);
+    setLoadingText(`Computing SEBAL ET for ${date} — fetching ERA5-Land from CDS...`);
+    try {
+      const payload = {
+        item_id: sceneId,
+        bbox: [minLon, minLat, maxLon, maxLat],
+        palette: etPalette,
+        vis_min: etVisMin !== "" ? parseFloat(etVisMin) : null,
+        vis_max: etVisMax !== "" ? parseFloat(etVisMax) : null,
+        geometry: uploadedGeoJson
+      };
+      const res = await fetch(`${API_BASE}/api/et/single`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "SEBAL ET failed for this scene");
+      }
+      const data = await res.json();
+      setSelectedSceneId(sceneId);
+      renderRasterOverlay(data.image_url, data.bbox || [minLon, minLat, maxLon, maxLat]);
+      showToast(`ET map for ${date}: mean ${(data.stats?.mean ?? 0).toFixed(2)} mm/day`);
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
       setLoading(false);
     }
   };
@@ -2652,7 +2785,41 @@ function App() {
     analysisMode === "lulc" && lulcResult ? lulcResult.geotiff_url :
     analysisMode === "similarity" && similarityResult ? similarityResult.geotiff_url :
     analysisMode === "flood" && floodResult ? floodResult.geotiff_url :
+    analysisMode === "et" && etSingleResult ? etSingleResult.geotiff_url :
     spectralResult ? spectralResult.geotiff_url : null;
+
+  // Two top-level feature groups shown in the header (H1); the active group's
+  // sub-features are listed in the left sidebar.
+  const FEATURE_GROUPS = [
+    { id: "monitoring", label: "Monitoring & Analysis", icon: Layers, features: [
+      { value: "single", label: "Single Scene Scan" },
+      { value: "timeseries", label: "Seasonal Trend" },
+      { value: "lulc", label: "LULC Mapping" },
+      { value: "aef", label: "AI Clustering (AEF)" },
+      { value: "similarity", label: "AI Similarity (AEF)" },
+      { value: "et", label: "Evapotranspiration (SEBAL)" },
+    ] },
+    { id: "disaster", label: "Disaster Management", icon: AlertTriangle, features: [
+      { value: "flood", label: "Flood Detection (SAR)" },
+      { value: "lsm", label: "Landslide Susceptibility Map" },
+      { value: "deformation", label: "Deformation Rate Map" },
+    ] },
+  ];
+  const groupOfMode = (m) => (["flood", "lsm", "deformation"].includes(m) ? "disaster" : "monitoring");
+  const currentGroupId = groupOfMode(analysisMode);
+  const currentGroup = FEATURE_GROUPS.find(g => g.id === currentGroupId);
+
+  const selectFeature = (value) => {
+    if (value === analysisMode) return;
+    if (value === "et") setPlatform("Landsat 9 (Optical)");  // SEBAL needs Landsat-9 thermal
+    setAnalysisMode(value);
+    handleClearAll();
+  };
+  const selectGroup = (gid) => {
+    if (gid === currentGroupId) return;
+    const g = FEATURE_GROUPS.find(x => x.id === gid);
+    if (g) selectFeature(g.features[0].value);   // jump to the group's first tool
+  };
 
   return (
     <div className="app-viewport">
@@ -2705,94 +2872,28 @@ function App() {
           style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', zIndex: 1001 }}
         >
           <h1 style={{ fontSize: 'inherit', fontWeight: 'inherit', margin: 0, color: 'inherit', fontFamily: 'inherit', letterSpacing: 'inherit', display: 'flex', alignItems: 'center' }}>
-            <div 
-              onClick={() => setIsModeDropdownOpen(!isModeDropdownOpen)}
-              className="flex items-center gap-2 bg-slate-900/50 hover:bg-slate-900/80 px-4 py-1.5 rounded-full border border-cyan-500/15 hover:border-cyan-500/30 transition-all duration-150 select-none" 
-              style={{ position: 'relative', cursor: 'pointer', minWidth: '220px', justifyContent: 'space-between' }}
-            >
-              <div className="flex items-center gap-2">
-                <Layers size={13} className="text-cyan-400" />
-                <span style={{
-                  color: 'var(--text-main)',
-                  fontSize: '0.9rem',
-                  fontWeight: '700',
-                  fontFamily: 'var(--font-hud)',
-                  whiteSpace: 'nowrap'
-                }}>
-                  {analysisMode === "single" && "Single Scene Scan"}
-                  {analysisMode === "timeseries" && "Seasonal Trend"}
-                  {analysisMode === "lulc" && "LULC Mapping"}
-                  {analysisMode === "aef" && "AI Clustering (AEF)"}
-                  {analysisMode === "similarity" && "AI Similarity (AEF)"}
-                  {analysisMode === "flood" && "Flood Detection (SAR)"}
-                  {analysisMode === "lsm" && "Landslide Susceptibility Map"}
-                  {analysisMode === "deformation" && "Deformation Rate Map"}
-                </span>
-              </div>
-              <ChevronDown size={12} className={`text-slate-400 transition-transform duration-200 ${isModeDropdownOpen ? 'rotate-180' : ''}`} />
-              
-              {isModeDropdownOpen && (
-                <div 
-                  style={{
-                    position: 'absolute',
-                    top: 'calc(100% + 8px)',
-                    left: '50%',
-                    transform: 'translateX(-50%)',
-                    width: '260px',
-                    backgroundColor: 'rgba(15, 23, 42, 0.95)',
-                    backdropFilter: 'blur(12px)',
-                    border: '1px solid rgba(56, 189, 248, 0.15)',
-                    borderRadius: '12px',
-                    boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5)',
-                    padding: '6px',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '2px',
-                    zIndex: 1002
-                  }}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {[
-                    { value: "single", label: "Single Scene Scan" },
-                    { value: "timeseries", label: "Seasonal Trend" },
-                    { value: "lulc", label: "LULC Mapping" },
-                    { value: "aef", label: "AI Clustering (AEF)" },
-                    { value: "similarity", label: "AI Similarity (AEF)" },
-                    { value: "flood", label: "Flood Detection (SAR)" },
-                    { value: "lsm", label: "Landslide Susceptibility Map" },
-                    { value: "deformation", label: "Deformation Rate Map" }
-                  ].map((mode) => {
-                    const isActive = analysisMode === mode.value;
-                    return (
-                      <div
-                        key={mode.value}
-                        onClick={() => {
-                          setAnalysisMode(mode.value);
-                          handleClearAll();
-                          setIsModeDropdownOpen(false);
-                        }}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          padding: '8px 12px',
-                          borderRadius: '6px',
-                          fontSize: '0.825rem',
-                          fontWeight: isActive ? '700' : '500',
-                          color: isActive ? 'var(--accent-sky)' : 'var(--text-secondary)',
-                          backgroundColor: isActive ? 'rgba(56, 189, 248, 0.1)' : 'transparent',
-                          transition: 'all 0.15s ease',
-                          cursor: 'pointer'
-                        }}
-                        className="hover:bg-slate-800/60 hover:text-white"
-                      >
-                        <span>{mode.label}</span>
-                        {isActive && <Check size={12} className="text-cyan-400" />}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+            <div className="flex items-center gap-1 bg-slate-900/50 rounded-full border border-cyan-500/15 p-1"
+                 style={{ backdropFilter: 'blur(8px)' }}>
+              {FEATURE_GROUPS.map(g => {
+                const active = currentGroupId === g.id;
+                const GIcon = g.icon;
+                return (
+                  <button
+                    key={g.id}
+                    onClick={() => selectGroup(g.id)}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-full transition-all duration-150 select-none"
+                    style={{
+                      fontSize: '0.85rem', fontWeight: 700, fontFamily: 'var(--font-hud)', whiteSpace: 'nowrap',
+                      color: active ? 'var(--accent-sky)' : 'var(--text-secondary)',
+                      background: active ? 'rgba(56,189,248,0.12)' : 'transparent',
+                      border: 'none', cursor: 'pointer'
+                    }}
+                  >
+                    <GIcon size={13} className={active ? 'text-cyan-400' : 'text-slate-400'} />
+                    {g.label}
+                  </button>
+                );
+              })}
             </div>
           </h1>
         </div>
@@ -2895,7 +2996,30 @@ function App() {
         
         {/* LEFT CONTROL SIDEBAR */}
         <aside className="sidebar">
-          
+
+          {/* CARD 1: FEATURE SELECT — sub-features of the active header group */}
+          <div className="sidebar-card">
+            <div className="card-header">
+              {(() => { const GIcon = currentGroup.icon; return <GIcon className="icon" />; })()}
+              <h2>{currentGroup.label}</h2>
+            </div>
+            <div className="card-body">
+              <div className="form-group" style={{ marginBottom: 0 }}>
+                <label>Active Tool</label>
+                <div className="custom-select">
+                  <select
+                    value={analysisMode === "et_timeseries" ? "et" : analysisMode}
+                    onChange={e => selectFeature(e.target.value)}
+                  >
+                    {currentGroup.features.map(f => (
+                      <option key={f.value} value={f.value}>{f.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* CARD 2: TARGET ROI CONFIGURATION */}
           {(analysisMode !== "lsm" && analysisMode !== "deformation") && (
           <div className="sidebar-card">
@@ -2983,7 +3107,11 @@ function App() {
                       setScenes([]);
                     }} 
                   >
-                    <option value="Sentinel-2 (Optical)">Sentinel-2 MSI</option>
+                    {/* SEBAL needs a thermal band — Sentinel-2 has none, so it is
+                        not offered for Evapotranspiration. */}
+                    {!(analysisMode === "et" || analysisMode === "et_timeseries") && (
+                      <option value="Sentinel-2 (Optical)">Sentinel-2 MSI</option>
+                    )}
                     <option value="Landsat 8 (Optical)">Landsat 8 C2 L2</option>
                     <option value="Landsat 9 (Optical)">Landsat 9 C2 L2</option>
                   </select>
@@ -3015,7 +3143,7 @@ function App() {
                 {searchLoading ? "Querying STAC..." : "Query Satellite Items"}
               </button>
 
-              {analysisMode === "single" && scenes.length > 0 && (
+              {(analysisMode === "single" || analysisMode === "et") && scenes.length > 0 && (
                 <div className="form-group mt-2">
                   <label>Select Scene Timeline ({scenes.length})</label>
                   <div className="custom-select">
@@ -3042,6 +3170,15 @@ function App() {
                   <span className="text-cyan-400 font-bold uppercase tracking-wider">Seasonal Trend Query</span>
                   <p className="leading-relaxed text-slate-400">
                     No single scene selection needed. The system will extract & compute statistics for all clear satellite captures within the selected season.
+                  </p>
+                </div>
+              )}
+
+              {analysisMode === "et_timeseries" && (
+                <div className="mt-3 p-2.5 bg-slate-900/40 border border-cyan-500/10 rounded flex flex-col gap-1 text-[10px] text-slate-400">
+                  <span className="text-cyan-400 font-bold uppercase tracking-wider">ET Trend Query</span>
+                  <p className="leading-relaxed text-slate-400">
+                    No single scene selection needed. SEBAL ET is computed for Landsat-9 scenes across the season (all scenes eligible; cloud % is reported per point).
                   </p>
                 </div>
               )}
@@ -3402,8 +3539,99 @@ function App() {
           </div>
           )}
 
-          {/* CARD 4: ANALYTICS PARAMETERS — hidden in LULC/AEF/Similarity mode */}
-          {(analysisMode !== "lulc" && analysisMode !== "aef" && analysisMode !== "similarity" && analysisMode !== "flood" && analysisMode !== "lsm" && analysisMode !== "deformation") && (
+          {/* CARD 3f: EVAPOTRANSPIRATION (SEBAL) CONFIGURATION — visible only in ET modes */}
+          {(analysisMode === "et" || analysisMode === "et_timeseries") && (
+          <div className="sidebar-card">
+            <div className="card-header">
+              <Droplets className="icon" />
+              <h2>EVAPOTRANSPIRATION</h2>
+            </div>
+            <div className="card-body">
+              {/* Single-date vs seasonal-trend toggle */}
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => setAnalysisMode("et")}
+                  className={`radio-button flex-1 justify-center ${analysisMode === "et" ? 'active' : ''}`}
+                  style={{ padding: '8px 0', fontSize: '11px', gap: '6px' }}
+                >
+                  <Eye size={13} /> Single Date
+                </button>
+                <button
+                  onClick={() => setAnalysisMode("et_timeseries")}
+                  className={`radio-button flex-1 justify-center ${analysisMode === "et_timeseries" ? 'active' : ''}`}
+                  style={{ padding: '8px 0', fontSize: '11px', gap: '6px' }}
+                >
+                  <Activity size={13} /> Time Series
+                </button>
+              </div>
+
+              <div className="form-group mt-3">
+                <label>Color Palette</label>
+                <div className="custom-select">
+                  <select value={etPalette} onChange={e => setEtPalette(e.target.value)}>
+                    <option value="ET (Dry-Wet)">ET (Dry → Wet)</option>
+                    <option value="Ocean (Water Depth)">Ocean (Blue)</option>
+                    <option value="Viridis (Sequential)">Viridis</option>
+                    <option value="Blue-Yellow-Red (Thermal)">Blue-Yellow-Red</option>
+                    <option value="Turbo (Rainbow Enhanced)">Turbo (Rainbow)</option>
+                  </select>
+                </div>
+              </div>
+
+              {analysisMode === "et" && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="form-group">
+                    <label>Stretch Min</label>
+                    <input type="number" step="0.5" value={etVisMin} onChange={e => setEtVisMin(e.target.value)} className="input-cyber" placeholder="auto" />
+                  </div>
+                  <div className="form-group">
+                    <label>Stretch Max</label>
+                    <input type="number" step="0.5" value={etVisMax} onChange={e => setEtVisMax(e.target.value)} className="input-cyber" placeholder="auto" />
+                  </div>
+                </div>
+              )}
+
+              {analysisMode === "et_timeseries" && (
+                <div className="form-group">
+                  <label>Max Scenes to Scan ({etMaxScenes})</label>
+                  <input
+                    type="range"
+                    min="2"
+                    max="8"
+                    value={etMaxScenes}
+                    onChange={e => setEtMaxScenes(parseInt(e.target.value))}
+                  />
+                  <span className="text-[9px] text-slate-400 mt-1 block">
+                    Each date fetches ERA5-Land from Copernicus CDS (slow, queued) — keep this small. Subsamples evenly across the range.
+                  </span>
+                </div>
+              )}
+
+              <div className="mt-3 p-2.5 bg-slate-900/40 border border-cyan-500/10 rounded flex flex-col gap-1 text-[10px] text-slate-400">
+                <span className="text-cyan-400 font-bold uppercase tracking-wider">
+                  SEBAL · Landsat-9 + ERA5-Land
+                </span>
+                <p className="leading-relaxed text-slate-400">
+                  Surface energy balance (λE = Rn − G0 − H) yields daily actual ET (mm/day). Uses Landsat-9 thermal + surface reflectance and ERA5-Land overpass meteorology. Requires a <span className="text-white font-mono">~/.cdsapirc</span> CDS key. Small ROIs work too — the hot/cold anchors are calibrated from the surrounding ~13 km and the result is cropped back to your area.
+                </p>
+              </div>
+
+              <button
+                onClick={analysisMode === "et" ? runEtSingle : runEtSeries}
+                disabled={etLoading}
+                className="submit-btn-pill active py-2 text-xs w-full flex justify-center items-center gap-2 mt-3"
+              >
+                <Droplets size={12} className={etLoading ? "animate-spin" : ""} />
+                {etLoading
+                  ? (analysisMode === "et" ? "Computing ET..." : "Computing ET Trend...")
+                  : (analysisMode === "et" ? "Compute Evapotranspiration" : "Run ET Time Series")}
+              </button>
+            </div>
+          </div>
+          )}
+
+          {/* CARD 4: ANALYTICS PARAMETERS — hidden in LULC/AEF/Similarity/Flood/ET mode */}
+          {(analysisMode !== "lulc" && analysisMode !== "aef" && analysisMode !== "similarity" && analysisMode !== "flood" && analysisMode !== "et" && analysisMode !== "et_timeseries" && analysisMode !== "lsm" && analysisMode !== "deformation") && (
           <div className="sidebar-card">
             <div className="card-header">
               <Sliders className="icon" />
@@ -3502,7 +3730,7 @@ function App() {
           {/* Legend removed from here and placed in footer */}
 
           {/* CARD 6: INFO BOX */}
-          {(analysisMode !== "flood" && analysisMode !== "lsm" && analysisMode !== "deformation") && (
+          {(analysisMode !== "flood" && analysisMode !== "et" && analysisMode !== "et_timeseries" && analysisMode !== "lsm" && analysisMode !== "deformation") && (
           <div className="info-box-card">
             <Activity className="icon-info" />
             <p>
@@ -3865,7 +4093,9 @@ function App() {
             (lulcResult && analysisMode === "lulc") ||
             (aefResult && analysisMode === "aef") ||
             (similarityResult && analysisMode === "similarity") ||
-            (floodResult && analysisMode === "flood")) && (
+            (floodResult && analysisMode === "flood") ||
+            (etSingleResult && analysisMode === "et") ||
+            (etSeriesResult && analysisMode === "et_timeseries")) && (
             <>
             <button 
               className={`results-toggle-btn ${!resultsPanelOpen ? 'collapsed' : ''}`}
@@ -4573,6 +4803,251 @@ function App() {
                 </div>
                 );
               })()}
+
+              {/* EVAPOTRANSPIRATION (SEBAL) — SINGLE-DATE RESULTS */}
+              {etSingleResult && analysisMode === "et" && (() => {
+                const s = etSingleResult.stats || {};
+                const bins = etSingleResult.density_bins || {};
+                const met = etSingleResult.met || {};
+                const anc = etSingleResult.anchors || {};
+                const num = (v) => (typeof v === "number" && !isNaN(v) ? v : 0);
+
+                const handleEtCsvExport = () => {
+                  let csv = "data:text/csv;charset=utf-8,";
+                  csv += "Metric,Value\n";
+                  csv += `Scene ID,${etSingleResult.scene_id}\n`;
+                  csv += `Date,${etSingleResult.date}\n`;
+                  csv += `Cloud Cover (%),${etSingleResult.cloud_cover ?? ""}\n`;
+                  csv += `Overpass Hour (UTC),${etSingleResult.overpass_hour_utc ?? ""}\n`;
+                  csv += `Mean ETa (mm/day),${num(s.mean).toFixed(3)}\n`;
+                  csv += `Std ETa (mm/day),${num(s.std).toFixed(3)}\n`;
+                  csv += `Min ETa (mm/day),${num(s.min).toFixed(3)}\n`;
+                  csv += `Max ETa (mm/day),${num(s.max).toFixed(3)}\n`;
+                  csv += `Valid Pixels,${num(s.valid_pixels)}\n`;
+                  csv += `Valid Area (km2),${num(s.valid_area_km2)}\n`;
+                  csv += `Water Volume (m3/day),${num(s.water_volume_m3_day)}\n`;
+                  csv += `Cold Anchor T (C),${num(anc.T_cold_C)}\n`;
+                  csv += `Hot Anchor T (C),${num(anc.T_hot_C)}\n`;
+                  csv += `Stability Iterations,${num(anc.iterations)}\n`;
+                  csv += `Air Temp (C),${num(met.T_air_C)}\n`;
+                  csv += `Relative Humidity (%),${num(met.RH_pct)}\n`;
+                  csv += `Wind Speed (m/s),${num(met.wind_speed)}\n`;
+                  csv += `Rs down (W/m2),${num(met.Rs_down)}\n`;
+                  csv += `FAO-56 ET0 (mm/day),${etSingleResult.et0 ?? ""}\n`;
+                  csv += `Crop Coefficient Kc,${etSingleResult.kc ?? ""}\n`;
+                  const link = document.createElement("a");
+                  link.setAttribute("href", encodeURI(csv));
+                  link.setAttribute("download", `SEBAL_ET_${etSingleResult.date}.csv`);
+                  document.body.appendChild(link);
+                  link.click();
+                  document.body.removeChild(link);
+                };
+
+                // ET-intensity label + position on a 0–8 mm/day gauge.
+                const meanEt = num(s.mean);
+                const etLevel = meanEt > 6 ? { label: 'Very high water use', color: '#3b82f6' }
+                  : meanEt >= 4 ? { label: 'High water use', color: '#22c55e' }
+                  : meanEt >= 2 ? { label: 'Moderate water use', color: '#f59e0b' }
+                  : { label: 'Low water use', color: '#ef4444' };
+                const gaugeMax = 8;
+                const gaugePct = Math.max(0, Math.min(100, (meanEt / gaugeMax) * 100));
+                // Crop coefficient interpretation.
+                const kcVal = etSingleResult.kc;
+                const kcInfo = kcVal == null ? null
+                  : kcVal >= 1.0 ? { label: 'very high water use', color: '#3b82f6' }
+                  : kcVal >= 0.7 ? { label: 'well-watered', color: '#22c55e' }
+                  : kcVal >= 0.4 ? { label: 'moderate', color: '#f59e0b' }
+                  : { label: 'low / water-stressed', color: '#ef4444' };
+                const distClasses = [
+                  { key: 'very_high', label: 'Very high >6', color: '#1e3a8a' },
+                  { key: 'high', label: 'High 4–6', color: '#16a34a' },
+                  { key: 'moderate', label: 'Moderate 2–4', color: '#f59e0b' },
+                  { key: 'low', label: 'Low <2', color: '#dc2626' },
+                ];
+
+                return (
+                <div className="glass-panel p-4 flex flex-col gap-3" style={{ maxHeight: '80vh', overflowY: 'auto' }}>
+                  <div className="results-header">
+                    <span>💧 EVAPOTRANSPIRATION (SEBAL)</span>
+                    <Droplets size={14} className="text-cyan-400" />
+                  </div>
+
+                  <div className="text-[10px] text-slate-400 flex items-center gap-2 flex-wrap">
+                    <span className="text-cyan-400 font-bold uppercase">Landsat-9</span>
+                    <span>•</span>
+                    <span className="font-mono">{etSingleResult.date}</span>
+                    {etSingleResult.cloud_cover != null && (<><span>•</span><span>{num(etSingleResult.cloud_cover).toFixed(0)}% cloud</span></>)}
+                  </div>
+
+                  {/* Headline mean ET + intensity gauge + water volume */}
+                  <div className="p-3 rounded-lg flex flex-col gap-2 border"
+                       style={{ borderColor: etLevel.color + '55',
+                                background: 'linear-gradient(135deg, rgba(15,23,42,0.65), rgba(2,6,23,0.35))' }}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: etLevel.color }}>Mean Actual ET</span>
+                      <span className="text-[9px] font-bold uppercase px-2 py-0.5 rounded-full"
+                            style={{ color: etLevel.color, background: etLevel.color + '22' }}>{etLevel.label}</span>
+                    </div>
+                    <div className="flex items-baseline gap-1.5">
+                      <span className="text-3xl font-bold text-white font-mono leading-none">{meanEt.toFixed(2)}</span>
+                      <span className="text-xs text-slate-400">mm/day</span>
+                    </div>
+                    {/* dry→wet intensity gauge with a marker at the mean */}
+                    <div className="relative w-full rounded-full mt-0.5"
+                         style={{ height: '8px', background: 'linear-gradient(90deg,#8B0000,#FF4500,#FFFF00,#00FF00,#000080)' }}>
+                      <div className="absolute rounded-sm"
+                           style={{ left: `calc(${gaugePct}% - 1.5px)`, top: '-3px', width: '3px', height: '14px',
+                                    background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.6)' }} />
+                    </div>
+                    <div className="flex justify-between text-[8px] text-slate-500 font-mono">
+                      <span>0</span><span>dry → wet</span><span>{gaugeMax} mm/day</span>
+                    </div>
+                    <div className="text-[10px] text-slate-400 pt-1.5 border-t border-slate-700/50">
+                      ≈ <span className="text-white font-semibold">{num(s.water_volume_m3_day).toLocaleString()}</span> m³/day over {num(s.valid_area_km2).toLocaleString()} km²
+                    </div>
+                  </div>
+
+                  <div className="stats-grid">
+                    <div className="stat-card">
+                      <div className="stat-label">Mean</div>
+                      <div className="stat-val high">{num(s.mean).toFixed(2)}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Std Dev</div>
+                      <div className="stat-val">{num(s.std).toFixed(2)}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Min</div>
+                      <div className="stat-val danger">{num(s.min).toFixed(2)}</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-label">Max</div>
+                      <div className="stat-val success">{num(s.max).toFixed(2)}</div>
+                    </div>
+                  </div>
+
+                  {/* FAO-56 reference ET0 + crop coefficient */}
+                  {etSingleResult.et0 != null && (
+                    <>
+                      <div className="lulc-section-title">Reference ET (FAO-56)</div>
+                      <div className="stats-grid">
+                        <div className="stat-card">
+                          <div className="stat-label">ET₀ (mm/day)</div>
+                          <div className="stat-val">{num(etSingleResult.et0).toFixed(2)}</div>
+                        </div>
+                        <div className="stat-card">
+                          <div className="stat-label">Kc = ETa/ET₀</div>
+                          <div className="stat-val" style={{ color: kcInfo ? kcInfo.color : undefined }}>
+                            {kcVal != null ? num(kcVal).toFixed(2) : "—"}
+                          </div>
+                        </div>
+                      </div>
+                      {kcInfo && (
+                        <div className="flex items-center gap-1.5 text-[10px] text-slate-400 -mt-1">
+                          <span style={{ width: 7, height: 7, borderRadius: 999, background: kcInfo.color, display: 'inline-block' }} />
+                          Crop coefficient indicates <span className="font-semibold" style={{ color: kcInfo.color }}>{kcInfo.label}</span> vs. the reference surface.
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {/* ET class distribution — segmented proportion bar + legend */}
+                  {etSingleResult.density_bins && (
+                    <>
+                      <div className="lulc-section-title">ET Distribution (mm/day)</div>
+                      <div className="flex w-full rounded-full overflow-hidden bg-slate-800" style={{ height: '12px' }}>
+                        {distClasses.map(c => num(bins[c.key]) > 0 && (
+                          <div key={c.key} style={{ width: `${num(bins[c.key])}%`, background: c.color }}
+                               title={`${c.label}: ${num(bins[c.key])}%`} />
+                        ))}
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-1 mt-1">
+                        {distClasses.map(c => (
+                          <div key={c.key} className="flex items-center gap-1.5 text-[10px]">
+                            <span style={{ width: 8, height: 8, borderRadius: 2, background: c.color, display: 'inline-block', flexShrink: 0 }} />
+                            <span className="text-slate-400 flex-1 truncate">{c.label}</span>
+                            <span className="text-white font-mono">{num(bins[c.key])}%</span>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {/* Anchor calibration + meteorology */}
+                  <div className="lulc-section-title">SEBAL Anchors & Meteorology</div>
+                  <div className="p-3 bg-slate-900/40 rounded border border-slate-700/60 flex flex-col gap-1.5 text-[11px]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">Cold / Hot anchor</span>
+                      <span className="text-white font-mono">{num(anc.T_cold_C).toFixed(1)}°C / {num(anc.T_hot_C).toFixed(1)}°C</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">Air temp / RH</span>
+                      <span className="text-white font-mono">{num(met.T_air_C).toFixed(1)}°C / {num(met.RH_pct).toFixed(0)}%</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">Wind / Rs↓</span>
+                      <span className="text-white font-mono">{num(met.wind_speed).toFixed(1)} m/s / {num(met.Rs_down).toFixed(0)} W/m²</span>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-500 pt-1 border-t border-slate-700/60">
+                      <span>Overpass {etSingleResult.overpass_hour_utc}:00 UTC</span>
+                      <span>{num(anc.iterations)} stability iters</span>
+                    </div>
+                  </div>
+
+                  {(anc.cold_method === "relative" || anc.hot_method === "relative") && (
+                    <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 rounded flex items-start gap-2 text-amber-400">
+                      <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+                      <span className="text-[10px] leading-normal">
+                        Anchors were auto-selected from this scene's own NDVI range (adaptive mode — it lacked pixels above the strict vegetation thresholds). Spatial ET patterns are reliable; treat absolute magnitudes with some caution.
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="mt-1 pt-3 border-t border-slate-800/60 flex flex-col gap-2">
+                    <button
+                      onClick={() => renderRasterOverlay(etSingleResult.image_url, etSingleResult.bbox || [minLon, minLat, maxLon, maxLat])}
+                      className="radio-button py-2 text-xs justify-center items-center flex gap-1 border-dashed w-full"
+                    >
+                      <Eye size={14} /> View Image Overlay
+                    </button>
+                    <div className="flex justify-between items-center">
+                      <span className="text-[10px] text-slate-500 font-bold">
+                        Valid: {num(s.valid_pixels).toLocaleString()} px
+                      </span>
+                      <button onClick={handleEtCsvExport} className="excel-btn">
+                        Export CSV
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                );
+              })()}
+
+              {/* EVAPOTRANSPIRATION (SEBAL) — SEASONAL TREND RESULTS */}
+              {etSeriesResult && analysisMode === "et_timeseries" && (
+                <div className="glass-panel p-4 flex flex-col gap-3" style={{ maxHeight: '80vh', overflowY: 'auto' }}>
+                  <div className="results-header">
+                    <span>💧 SEASONAL ET TREND (SEBAL)</span>
+                    <Droplets size={14} className="text-cyan-400" />
+                  </div>
+
+                  <TimeSeriesChart
+                    data={etSeriesResult.timeseries}
+                    indexName="ETa (mm/day)"
+                    onViewScene={loadSpecificEtScene}
+                    activeSceneId={selectedSceneId}
+                  />
+
+                  {etSeriesResult.skipped && etSeriesResult.skipped.length > 0 && (
+                    <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 rounded flex items-start gap-2 text-amber-400">
+                      <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+                      <span className="text-[10px] leading-normal">
+                        {etSeriesResult.skipped.length} scene(s) skipped (anchor/CDS failure). SEBAL needs clear scenes with both vegetated and bare ground.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             </>
           )}
@@ -4592,6 +5067,7 @@ function App() {
                analysisMode === "similarity" ? "AlphaEarth Foundations" :
                analysisMode === "lulc" ? (lulcDataset === "esa-worldcover" ? "ESA WorldCover" : "IO LULC Annual") :
                analysisMode === "flood" ? "Sentinel-1 GRD (SAR)" :
+               (analysisMode === "et" || analysisMode === "et_timeseries") ? "Landsat-9 C2-L2 + ERA5-Land (SEBAL)" :
                analysisMode === "lsm" ? "Landslide Susceptibility Model (ILSM)" :
                analysisMode === "deformation" ? "InSAR Sentinel-1 (LOS Velocities)" :
                selectedSceneMeta ? selectedSceneMeta.sensor : "NO ACTIVE SENSOR"}
@@ -4610,6 +5086,8 @@ function App() {
                analysisMode === "similarity" ? `${aefYear} (Annual Composite)` :
                analysisMode === "lulc" ? `${lulcYear} (Annual Classification)` :
                analysisMode === "flood" ? (floodResult ? `${floodResult.pre_date} → ${floodResult.post_date}` : "Pre / Post date ranges") :
+               analysisMode === "et" ? (etSingleResult ? etSingleResult.date : "Select a Landsat-9 scene") :
+               analysisMode === "et_timeseries" ? `${startDate} → ${endDate}` :
                analysisMode === "lsm" ? "ILSM v1.0 (Static Overlays)" :
                analysisMode === "deformation" ? "Sentinel-1 Composite (2021-2024)" :
                selectedSceneMeta ? selectedSceneMeta.date : "IDLE / PENDING"}
@@ -4657,6 +5135,29 @@ function App() {
                   </div>
                   <div style={{ fontFamily: 'monospace', fontSize: '8px', color: 'var(--text-muted)' }}>
                     {(floodResult.stats?.area_km2 ?? 0).toLocaleString()} km² · {(floodResult.stats?.percentage ?? 0).toFixed(2)}% of ROI
+                  </div>
+                </div>
+              )}
+              {analysisMode === "et" && etSingleResult && (
+                <div style={{ display: 'flex', flexDirection: 'column', width: '100%', gap: '2px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '9px', fontWeight: '600', color: 'var(--text-main)' }}>
+                    <span>Actual ET (mm/day) · dry → wet</span>
+                  </div>
+                  <div style={{ height: '8px', width: '100%', borderRadius: '2px', background: `linear-gradient(90deg, ${get_color_palette(etPalette).join(', ')})` }}></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'monospace', fontSize: '8px', color: 'var(--text-muted)' }}>
+                    <span>{Number(etSingleResult.vis_min).toFixed(1)}</span>
+                    <span>{((Number(etSingleResult.vis_min) + Number(etSingleResult.vis_max)) / 2).toFixed(1)}</span>
+                    <span>{Number(etSingleResult.vis_max).toFixed(1)}</span>
+                  </div>
+                </div>
+              )}
+              {analysisMode === "et_timeseries" && etSeriesResult && (
+                <div style={{ display: 'flex', flexDirection: 'column', width: '100%', gap: '2px' }}>
+                  <div style={{ fontSize: '9px', fontWeight: '600', color: 'var(--text-main)' }}>
+                    <span>Seasonal ET trend — see chart</span>
+                  </div>
+                  <div style={{ fontFamily: 'monospace', fontSize: '8px', color: 'var(--text-muted)' }}>
+                    {etSeriesResult.timeseries?.length || 0} scene(s) · mean ETa (mm/day)
                   </div>
                 </div>
               )}

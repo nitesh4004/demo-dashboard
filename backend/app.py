@@ -31,6 +31,7 @@ from backend.pc_handler import (
     GDAL_OPTS,
     read_window_bands_parallel,
 )
+from backend import sebal
 
 app = FastAPI(title="PhytoLens API", description="Geospatial Tools for Crop Health")
 
@@ -112,6 +113,29 @@ class AefSimilarityRequest(BaseModel):
     # as water in homogeneous ROIs). "dotproduct" = raw dot product (Google's
     # literal method; best for diverse scenes / distinct rare targets).
     mode: Optional[str] = "centered"
+
+class EtRequest(BaseModel):
+    """Single-date SEBAL evapotranspiration for one Landsat-9 scene."""
+    item_id: str
+    bbox: List[float]                # [min_lon, min_lat, max_lon, max_lat]
+    palette: Optional[str] = "ET (Dry-Wet)"
+    vis_min: Optional[float] = None
+    vis_max: Optional[float] = None
+    geometry: Optional[Dict[str, Any]] = None
+
+class EtTimeSeriesRequest(BaseModel):
+    """SEBAL ETa trend over multiple Landsat-9 scenes in a date range.
+
+    No cloud filter — all Landsat-9 scenes in the window are eligible and each
+    point carries its scene cloud-cover %. Scenes are subsampled to max_scenes
+    (hard-capped) because every date triggers a separate, slow ERA5-Land (CDS)
+    retrieval.
+    """
+    bbox: List[float]
+    start_date: str
+    end_date: str
+    geometry: Optional[Dict[str, Any]] = None
+    max_scenes: Optional[int] = 6
 
 def clean_old_static_files(max_age_seconds=1800):
     """Remove generated static files older than max_age_seconds (default 30 min).
@@ -801,6 +825,401 @@ def detect_flood(req: FloodRequest):
         "post_count": len(post),
         "event_date": req.event_date,
         "orbit": orbit,
+    }
+
+
+# ============================================================
+# Evapotranspiration (SEBAL) — Landsat-9 + ERA5-Land (CDS)
+# ============================================================
+def _is_thermal_landsat(item):
+    """True for Landsat 8/9 scenes — both carry the thermal band (ST_B10) SEBAL
+    needs. Sentinel-2 has no thermal band and is not usable for SEBAL."""
+    ident = item.id.lower()
+    plat = str(item.properties.get("platform", "")).lower()
+    return ("landsat-8" in ident or "landsat-9" in ident
+            or plat in ("landsat-8", "landsat-9"))
+
+
+def _landsat_overpass_hour_utc(item):
+    """Rounded UTC acquisition hour from the STAC item, clamped to >=1.
+
+    sebal._cds_retrieve reads the [hour-1, hour] accumulation pair, so hour 0
+    would request '-01:00'. Clamp to 1 (Landsat descending passes are mid-morning
+    local, so the UTC hour is almost always well away from midnight anyway).
+    """
+    ts = item.properties.get("datetime", "")
+    try:
+        t = ts.replace("Z", "+00:00")
+        dt = __import__("datetime").datetime.fromisoformat(t)
+        return max(1, int(round(dt.hour + dt.minute / 60.0)))
+    except Exception:
+        return 5
+
+
+def _map_cds_error(e):
+    """Translate a Copernicus CDS / ERA5-Land failure into an actionable HTTP error."""
+    msg = str(e).lower()
+    if "cdsapirc" in msg or "no url" in msg or ("url" in msg and "key" in msg) \
+            or "missing/incomplete configuration" in msg:
+        return HTTPException(
+            status_code=400,
+            detail="Copernicus CDS credentials not found. Add your personal access "
+                   "token to a ~/.cdsapirc file (url + key) to fetch ERA5-Land data.")
+    if "401" in msg or "403" in msg or "not authorized" in msg or "forbidden" in msg \
+            or "licence" in msg or "license" in msg:
+        return HTTPException(
+            status_code=400,
+            detail="Copernicus CDS rejected the request — verify the API key and that "
+                   "the ERA5-Land licence is accepted in your CDS account.")
+    if "timeout" in msg or "timed out" in msg or "queue" in msg:
+        return HTTPException(
+            status_code=504,
+            detail="ERA5-Land retrieval timed out in the Copernicus CDS queue. "
+                   "Please try again shortly.")
+    return HTTPException(status_code=502, detail=f"ERA5-Land (CDS) retrieval failed: {e}")
+
+
+def _expand_bbox_for_anchors(bbox, min_half_deg=0.06):
+    """Grow a small ROI to a minimum window so SEBAL has scene context.
+
+    SEBAL's hot/cold anchors are scene-scale features — a tiny drawn ROI may
+    contain neither. We calibrate the anchors over this expanded window (~13 km
+    when the ROI is smaller) and later crop the ET back to the requested extent,
+    so even very small areas can be analysed. Returns the (possibly unchanged)
+    compute bbox centred on the ROI.
+    """
+    minx, miny, maxx, maxy = bbox
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    hx = max((maxx - minx) / 2.0, min_half_deg)
+    hy = max((maxy - miny) / 2.0, min_half_deg)
+    return [cx - hx, cy - hy, cx + hx, cy + hy]
+
+
+def _crop_to_bbox(arr, transform, target_bbox):
+    """Crop a raster (numpy array + affine transform) to target_bbox.
+
+    Used to return ET over the requested ROI after computing anchors on a larger
+    window. Returns (cropped_array, cropped_transform, actual_cropped_bbox).
+    """
+    import rasterio
+    from rasterio.windows import Window, transform as win_transform
+
+    minx, miny, maxx, maxy = target_bbox
+    H, W = arr.shape
+    inv = ~transform
+    c0, r0 = inv * (minx, maxy)   # top-left corner
+    c1, r1 = inv * (maxx, miny)   # bottom-right corner
+    col0 = max(0, int(np.floor(min(c0, c1))))
+    col1 = min(W, int(np.ceil(max(c0, c1))))
+    row0 = max(0, int(np.floor(min(r0, r1))))
+    row1 = min(H, int(np.ceil(max(r0, r1))))
+    col1 = max(col1, col0 + 1)    # always keep at least one pixel
+    row1 = max(row1, row0 + 1)
+    if col0 >= W or row0 >= H:     # ROI outside the computed grid — no crop
+        return arr, transform, target_bbox
+
+    win = Window(col0, row0, col1 - col0, row1 - row0)
+    sub = arr[row0:row1, col0:col1]
+    new_tf = win_transform(win, transform)
+    px_w, px_h = transform.a, -transform.e
+    new_minx, new_maxy = new_tf.c, new_tf.f
+    new_maxx = new_minx + (col1 - col0) * px_w
+    new_miny = new_maxy - (row1 - row0) * px_h
+    return sub, new_tf, [new_minx, new_miny, new_maxx, new_maxy]
+
+
+def _regrid_min_res(arr, transform, bbox, min_px=256, max_px=1500):
+    """Resample a raster up to a minimum display resolution (aspect-preserving).
+
+    A tiny ROI yields only a handful of native pixels, so the overlay looks blocky
+    and a polygon clip applied at that resolution has ragged edges. Resampling the
+    (unmasked) array to >= min_px on the short side — then masking at that finer
+    grid — gives a smooth overlay with crisp ROI clipping. Returns (arr2, transform2);
+    unchanged if the array is already large enough.
+    """
+    from rasterio.warp import reproject, Resampling
+    from rasterio.transform import from_bounds
+
+    h, w = arr.shape
+    if min(h, w) >= min_px:
+        return arr, transform
+    minx, miny, maxx, maxy = bbox
+    aspect = (maxx - minx) / (maxy - miny) if (maxy - miny) else 1.0
+    if aspect >= 1:
+        new_h = min_px
+        new_w = int(round(min_px * aspect))
+    else:
+        new_w = min_px
+        new_h = int(round(min_px / aspect))
+    new_w = max(min_px, min(new_w, max_px))
+    new_h = max(min_px, min(new_h, max_px))
+    dst_transform = from_bounds(minx, miny, maxx, maxy, new_w, new_h)
+    dst = np.full((new_h, new_w), np.nan, dtype=np.float32)
+    reproject(source=arr, destination=dst,
+              src_transform=transform, src_crs="EPSG:4326",
+              dst_transform=dst_transform, dst_crs="EPSG:4326",
+              src_nodata=np.nan, dst_nodata=np.nan, resampling=Resampling.bilinear)
+    return dst, dst_transform
+
+
+def _et_pixel_area_m2(bbox, shape):
+    """Approximate WGS84 pixel area [m^2] for the ET grid (as elsewhere in app.py)."""
+    h, w = shape
+    lat_center = (bbox[1] + bbox[3]) / 2.0
+    m_per_deg_lon = 111320 * np.cos(np.radians(lat_center))
+    m_per_deg_lat = 110540
+    pixel_w_m = ((bbox[2] - bbox[0]) / w) * m_per_deg_lon
+    pixel_h_m = ((bbox[3] - bbox[1]) / h) * m_per_deg_lat
+    return pixel_w_m * pixel_h_m
+
+
+def _et_density_bins(eta):
+    """Agronomic ETa bands (mm/day) as integer percentages of valid pixels."""
+    valid = eta[~np.isnan(eta) & ~np.isinf(eta)]
+    if len(valid) == 0:
+        return None
+    total = len(valid)
+    very_high = np.sum(valid > 6)
+    high = np.sum((valid >= 4) & (valid <= 6))
+    moderate = np.sum((valid >= 2) & (valid < 4))
+    low = np.sum(valid < 2)
+    return {
+        "very_high": int(round(very_high / total * 100)),
+        "high": int(round(high / total * 100)),
+        "moderate": int(round(moderate / total * 100)),
+        "low": int(round(low / total * 100)),
+    }
+
+
+@app.post("/api/et/single")
+def calculate_et_single(req: EtRequest):
+    """SEBAL actual evapotranspiration (mm/day) for one Landsat-9 scene."""
+    clean_old_static_files()
+    validate_bbox(req.bbox)
+
+    # 1. Resolve the Landsat-9 scene.
+    try:
+        catalog = get_catalog()
+        item = catalog.get_collection("landsat-c2-l2").get_item(req.item_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load scene: {e}")
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Landsat scene {req.item_id} not found.")
+    if not _is_thermal_landsat(item):
+        raise HTTPException(
+            status_code=400,
+            detail="SEBAL evapotranspiration requires a Landsat-8 or Landsat-9 scene "
+                   "(thermal band ST_B10). Sentinel-2 has no thermal band.")
+
+    lon = (req.bbox[0] + req.bbox[2]) / 2.0
+    lat = (req.bbox[1] + req.bbox[3]) / 2.0
+    date_str = item.properties.get("datetime", "")[:10]
+    hour = _landsat_overpass_hour_utc(item)
+    cloud_cover = item.properties.get("eo:cloud_cover", None)
+
+    # 2. Run the SEBAL pipeline over a window at least ~13 km wide so the hot/cold
+    #    anchors have scene context (a tiny ROI alone rarely contains both); the ET
+    #    is cropped back to the requested extent afterwards. Anchor failure -> 400;
+    #    CDS failure -> mapped error.
+    compute_bbox = _expand_bbox_for_anchors(req.bbox)
+    try:
+        result = sebal.run_sebal_single(item, compute_bbox, lon, lat, date_str, hour)
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        # The ERA5-Land (CDS) fetch is the most fragile step; classify anything
+        # that looks CDS-related into an actionable message, else a generic 500.
+        msg = str(e).lower()
+        cds_hint = any(k in msg for k in (
+            "cds", "cdsapi", "cdsapirc", "era5", "licence", "license",
+            "not authorized", "forbidden", "queue", "timed out", "401", "403"))
+        if cds_hint:
+            raise _map_cds_error(e)
+        raise HTTPException(status_code=500, detail=f"SEBAL computation failed: {e}")
+
+    eta = result["eta"]
+    transform = result["transform"]
+
+    # 3. Crop the ET grid back to the requested ROI extent (native 30 m resolution;
+    #    anchors were calibrated on the larger compute window above).
+    out_bbox = req.bbox
+    if compute_bbox != req.bbox:
+        eta, transform, out_bbox = _crop_to_bbox(eta, transform, req.bbox)
+
+    # A small ROI leaves only a few native pixels — resample up to a smooth display
+    # grid so the overlay isn't blocky and the ROI polygon clip has crisp edges.
+    # Stats and the GeoTIFF stay on the accurate native grid.
+    eta_disp, transform_disp = _regrid_min_res(eta, transform, out_bbox, min_px=256)
+
+    # Clip to a drawn/uploaded ROI polygon — mask the native grid (for stats/GeoTIFF)
+    # and the display grid (for the PNG) each at their own resolution.
+    if req.geometry:
+        from rasterio.features import geometry_mask
+        geoms = extract_geojson_geometries(req.geometry)
+        if geoms:
+            m_native = geometry_mask(geoms, out_shape=eta.shape, transform=transform, invert=False)
+            eta = np.where(m_native, np.nan, eta)
+            m_disp = geometry_mask(geoms, out_shape=eta_disp.shape, transform=transform_disp, invert=False)
+            eta_disp = np.where(m_disp, np.nan, eta_disp)
+
+    # 4. Stats, water volume, density bins.
+    stats = calculate_roi_stats(eta)
+    if np.isnan(stats.get("mean", np.nan)):
+        raise HTTPException(
+            status_code=400,
+            detail="No valid evapotranspiration pixels in the ROI (all cloud/water "
+                   "masked). Try a clearer scene or a different area.")
+
+    pixel_area_m2 = _et_pixel_area_m2(out_bbox, eta.shape)
+    valid_pixels = int(np.sum(~np.isnan(eta) & ~np.isinf(eta)))
+    valid_area_m2 = valid_pixels * pixel_area_m2
+    # mean ET (mm/day) over the valid area -> daily water volume (m^3/day).
+    water_volume_m3 = stats["mean"] * 1e-3 * valid_area_m2
+
+    density_bins = _et_density_bins(eta)
+
+    vmin = req.vis_min if req.vis_min is not None else stats["p2"]
+    vmax = req.vis_max if req.vis_max is not None else stats["p98"]
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+
+    # 5. Save PNG + GeoTIFF with the shared helpers.
+    req_id = str(uuid.uuid4())
+    png_filename = f"{req_id}_et.png"
+    tiff_filename = f"{req_id}_et.tif"
+    png_path = os.path.join(STATIC_DIR, png_filename)
+    tiff_path = os.path.join(STATIC_DIR, tiff_filename)
+    save_visual_png(eta_disp, vmin, vmax, get_color_palette(req.palette), png_path)  # smooth display grid
+    save_geotiff(eta, transform, result["crs"], tiff_path)                            # native-res export
+
+    anchors = result["anchors"]
+    met = result["met"]
+    et0 = result["et0"]
+
+    return {
+        "req_id": req_id,
+        "image_url": f"/api/static/{png_filename}",
+        "geotiff_url": f"/api/static/{tiff_filename}",
+        "stats": {
+            **stats,
+            "valid_pixels": valid_pixels,
+            "valid_area_km2": round(valid_area_m2 / 1e6, 3),
+            "water_volume_m3_day": round(water_volume_m3, 1),
+        },
+        "vis_min": round(float(vmin), 3),
+        "vis_max": round(float(vmax), 3),
+        "density_bins": density_bins,
+        "date": date_str,
+        "scene_id": item.id,
+        "bbox": out_bbox,
+        "cloud_cover": float(cloud_cover) if cloud_cover is not None else None,
+        "overpass_hour_utc": hour,
+        "anchors": {
+            "T_cold_C": round(anchors["T_cold"] - 273.15, 2),
+            "T_hot_C": round(anchors["T_hot"] - 273.15, 2),
+            "iterations": int(anchors["n_iter"]),
+            "cold_method": anchors.get("cold_method", "strict"),
+            "hot_method": anchors.get("hot_method", "strict"),
+        },
+        "met": {
+            "T_air_C": round(met["T_air_C"], 1),
+            "RH_pct": round(met["RH_pct"], 0),
+            "wind_speed": round(met["wind_speed"], 2),
+            "Rs_down": round(met["Rs_down"], 0),
+            "Rl_down": round(met["Rl_down"], 0),
+        },
+        "et0": round(et0["ET0"], 2) if et0 else None,
+        "kc": round(result["kc"], 2) if result.get("kc") is not None else None,
+    }
+
+
+@app.post("/api/et/time-series")
+def calculate_et_time_series(req: EtTimeSeriesRequest):
+    """SEBAL ETa trend over Landsat-9 scenes (one CDS fetch per date — capped)."""
+    clean_old_static_files()
+    validate_bbox(req.bbox)
+
+    date_range = f"{req.start_date}/{req.end_date}"
+    try:
+        results, items = search_stac(
+            collection="landsat-c2-l2",
+            bbox=req.bbox,
+            date_range=date_range,
+            cloud_cover=None,          # no filter — surface cloud % per scene instead
+            orbit="BOTH",
+            limit=100,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STAC search error: {str(e)}")
+
+    # Landsat-9 only (thermal band required for SEBAL).
+    item_map = {it.id: it for it in items if _is_thermal_landsat(it)}
+    results = [r for r in results if r["id"] in item_map]
+    if not results:
+        return {"timeseries": [], "index": "ETa (SEBAL)",
+                "platform": "Landsat 9 (Optical)", "skipped": []}
+
+    # Chronological, then subsample evenly to the (hard-capped) scene budget.
+    results.sort(key=lambda x: x["date"])
+    max_s = min(req.max_scenes or 6, 8)
+    if len(results) > max_s:
+        idx = np.linspace(0, len(results) - 1, max_s, dtype=int)
+        results = [results[i] for i in idx]
+
+    lon = (req.bbox[0] + req.bbox[2]) / 2.0
+    lat = (req.bbox[1] + req.bbox[3]) / 2.0
+    # Calibrate anchors on a >=~13 km window (small ROIs lack scene contrast),
+    # then crop each ETa back to the ROI for the per-scene statistics.
+    compute_bbox = _expand_bbox_for_anchors(req.bbox)
+
+    timeseries, skipped = [], []
+    for scene in results:
+        scene_id = scene["id"]
+        date_str = scene["date"]
+        cc = scene["cloud_cover"]
+        item = item_map[scene_id]
+        try:
+            hour = _landsat_overpass_hour_utc(item)
+            # ET0 not needed per-point; skip it to save one CDS fetch per scene.
+            res = sebal.run_sebal_single(item, compute_bbox, lon, lat, date_str, hour,
+                                         with_et0=False)
+            eta = res["eta"]
+            tf = res["transform"]
+            if compute_bbox != req.bbox:
+                eta, tf, _ = _crop_to_bbox(eta, tf, req.bbox)
+            if req.geometry:
+                from rasterio.features import geometry_mask
+                geoms = extract_geojson_geometries(req.geometry)
+                if geoms:
+                    m = geometry_mask(geoms, out_shape=eta.shape,
+                                      transform=tf, invert=False)
+                    eta = np.where(m, np.nan, eta)
+            stats = calculate_roi_stats(eta)
+            if np.isnan(stats.get("mean", np.nan)):
+                skipped.append({"date": date_str, "reason": "no valid ET pixels"})
+                continue
+            timeseries.append({
+                "date": date_str,
+                "scene_id": scene_id,
+                "mean": float(stats["mean"]),
+                "min": float(stats["min"]),
+                "max": float(stats["max"]),
+                "std": float(stats["std"]),
+                "cloud_cover": float(cc) if cc is not None else 0.0,
+            })
+        except Exception as e:
+            # One scene's CDS/anchor failure must not abort the whole series.
+            print(f"[et-timeseries] skipping {scene_id}: {e}")
+            skipped.append({"date": date_str, "reason": str(e)[:200]})
+            continue
+
+    return {
+        "timeseries": timeseries,
+        "index": "ETa (SEBAL)",
+        "platform": "Landsat 9 (Optical)",
+        "skipped": skipped,
     }
 
 

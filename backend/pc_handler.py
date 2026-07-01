@@ -218,10 +218,22 @@ def read_aligned_bands(item, bbox_wgs84, band_mapping, target_resolution=10):
     
     width = int(np.ceil((max_lon - min_lon) / deg_resolution))
     height = int(np.ceil((max_lat - min_lat) / deg_resolution))
-    
+
     # Cap dimensions to avoid out-of-memory or timeout errors (max 1500x1500)
-    width = max(10, min(width, 1500))
-    height = max(10, min(height, 1500))
+    width = min(width, 1500)
+    height = min(height, 1500)
+    # Ensure a minimum display resolution so a SMALL ROI is not rendered as a few
+    # blocky native pixels (which also makes any ROI-polygon clip look ragged).
+    # Upscale preserving aspect; normal-sized ROIs (short side >= MIN_DISP) are
+    # left unchanged, so this only affects tiny areas.
+    MIN_DISP = 256
+    short = max(1, min(width, height))
+    if short < MIN_DISP:
+        scale = MIN_DISP / short
+        width = min(1500, int(round(width * scale)))
+        height = min(1500, int(round(height * scale)))
+    width = max(10, width)
+    height = max(10, height)
     
     pixel_w = (max_lon - min_lon) / width
     pixel_h = (max_lat - min_lat) / height
@@ -396,6 +408,8 @@ def get_color_palette(name):
         "Plasma (Sequential)": ['#0d0887', '#46039f', '#7201a8', '#9c179e', '#bd3786', '#d8576b', '#ed7953', '#fb9f3a', '#fdca26', '#f0f921'],
         "Turbo (Rainbow Enhanced)": ['#30123b', '#466be3', '#28bbec', '#32f197', '#a2fc3c', '#f2f221', '#fc8961', '#cf2547', '#7a0403'],
         "Ocean (Water Depth)": ['#ffffd9', '#edf8b1', '#c7e9b4', '#7fcdbb', '#41b6c4', '#1d91c0', '#225ea8', '#253494', '#081d58'],
+        # Evapotranspiration: low -> high = dry -> wet (darkred -> orange -> yellow -> green -> navy).
+        "ET (Dry-Wet)": ['#8B0000', '#FF4500', '#FFFF00', '#00FF00', '#000080'],
         "Terrain (Elevation)": ['#006400', '#32CD32', '#FFFF00', '#DAA520', '#8B4513', '#A0522D', '#D2691E', '#CD853F', '#F4A460', '#DEB887', '#D3D3D3', '#FFFFFF'],
         "Greyscale": ['#000000', '#FFFFFF']
     }
@@ -565,8 +579,19 @@ def fetch_lulc_raster(bbox_wgs84, dataset, year):
     height = int(np.ceil((max_lat - min_lat) / deg_resolution))
 
     # Cap dimensions
-    width = max(10, min(width, 2000))
-    height = max(10, min(height, 2000))
+    width = min(width, 2000)
+    height = min(height, 2000)
+    # Minimum display resolution so a small ROI isn't a few blocky pixels (only
+    # affects tiny areas; normal ROIs are unchanged). Classes use nearest
+    # resampling, so boundaries stay crisp.
+    MIN_DISP = 256
+    short = max(1, min(width, height))
+    if short < MIN_DISP:
+        scale = MIN_DISP / short
+        width = min(2000, int(round(width * scale)))
+        height = min(2000, int(round(height * scale)))
+    width = max(10, width)
+    height = max(10, height)
 
     pixel_w = (max_lon - min_lon) / width
     pixel_h = (max_lat - min_lat) / height
@@ -667,10 +692,18 @@ def compute_flood_grid(bbox_wgs84, target_resolution=10, max_dim=1500):
     min_lon, min_lat, max_lon, max_lat = bbox_wgs84
     deg_per_meter = 1.0 / 111000.0
     deg_resolution = target_resolution * deg_per_meter
-    width = int(np.ceil((max_lon - min_lon) / deg_resolution))
-    height = int(np.ceil((max_lat - min_lat) / deg_resolution))
-    width = max(10, min(width, max_dim))
-    height = max(10, min(height, max_dim))
+    width = min(int(np.ceil((max_lon - min_lon) / deg_resolution)), max_dim)
+    height = min(int(np.ceil((max_lat - min_lat) / deg_resolution)), max_dim)
+    # Minimum resolution so a small ROI isn't a few blocky pixels (aspect-preserving;
+    # normal ROIs unchanged).
+    MIN_DISP = 256
+    short = max(1, min(width, height))
+    if short < MIN_DISP:
+        scale = MIN_DISP / short
+        width = min(max_dim, int(round(width * scale)))
+        height = min(max_dim, int(round(height * scale)))
+    width = max(10, width)
+    height = max(10, height)
     pixel_w = (max_lon - min_lon) / width
     pixel_h = (max_lat - min_lat) / height
     transform = from_origin(min_lon, max_lat, pixel_w, pixel_h)
