@@ -6,7 +6,6 @@ planetary-computer
 rasterio
 numpy
 pandas
-pyarrow
 scikit-learn
 scipy
 pillow
