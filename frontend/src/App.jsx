@@ -25,11 +25,18 @@ import {
   ChevronDown,
   Check,
   Droplets,
-  Waves
+  Waves,
+  ArrowDown,
+  ArrowUp,
+  LineChart,
+  Leaf,
+  Info,
+  Cloud
 } from 'lucide-react';
 
 const get_color_palette = (name) => {
   const palettes = {
+    "ET (Dry-Wet)": ['#8B0000', '#FF4500', '#FFFF00', '#00FF00', '#000080'],
     "Red-Yellow-Green (Vegetation)": ['#d7191c', '#fdae61', '#ffffbf', '#a6d96a', '#1a9641'],
     "Blue-White-Green (Water/Veg)": ['#0000ff', '#ffffff', '#008000'],
     "Blue-Yellow-Red (Thermal)": ['#2c7bb6', '#abd9e9', '#ffffbf', '#fdae61', '#d7191c'],
@@ -838,8 +845,15 @@ function App() {
 
   // Satellite search state
   const [platform, setPlatform] = useState("Sentinel-2 (Optical)");
-  const [startDate, setStartDate] = useState("2024-01-01");
-  const [endDate, setEndDate] = useState("2024-02-15");
+  const [startDate, setStartDate] = useState(() => {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 2);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  });
+  const [endDate, setEndDate] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  });
   const [cloudCover, setCloudCover] = useState(12);
   const [orbit, setOrbit] = useState("BOTH");
 
@@ -991,12 +1005,12 @@ function App() {
 
   // Load LSM districts data and precomputed stats on mount
   useEffect(() => {
-    fetch('/districts.json')
+    fetch(`${import.meta.env.BASE_URL}districts.json`)
       .then(res => res.json())
       .then(data => setLsmDistrictsData(data))
       .catch(err => console.error("Error loading LSM districts:", err));
 
-    fetch('/district_stats.json')
+    fetch(`${import.meta.env.BASE_URL}district_stats.json`)
       .then(res => res.json())
       .then(data => {
         const lookup = {};
@@ -1158,7 +1172,7 @@ function App() {
     }
 
     if (activeLsmOverlay !== 'none') {
-      const url = activeLsmOverlay === 'classes' ? '/lsm_map.png' : '/probability_map.png';
+      const url = activeLsmOverlay === 'classes' ? `${import.meta.env.BASE_URL}lsm_map.png` : `${import.meta.env.BASE_URL}probability_map.png`;
       const bounds = [
         [7.874581612284692, 68.6315],
         [37.0005, 97.2604328483906]
@@ -1269,13 +1283,13 @@ function App() {
   useEffect(() => {
     if (analysisMode !== "deformation") return;
     if (!defManifest) {
-      fetch('/velocity_data/data/manifest.json')
+      fetch(`${import.meta.env.BASE_URL}velocity_data/data/manifest.json`)
         .then((r) => r.json())
         .then(setDefManifest)
         .catch((err) => console.error('Could not load velocity manifest', err));
     }
     if (!defIndiaGeoJson) {
-      fetch('/velocity_data/data/india_states.geojson')
+      fetch(`${import.meta.env.BASE_URL}velocity_data/data/india_states.geojson`)
         .then((r) => r.json())
         .then(setDefIndiaGeoJson)
         .catch((err) => console.error('Could not load india_states.geojson', err));
@@ -1373,7 +1387,7 @@ function App() {
     for (const layer of defManifest.layers) {
       let ov = defOverlaysRef.current.get(layer.id);
       if (defVisibleLayers.has(layer.id)) {
-        const imageUrl = `/velocity_data/${layer.png}`;
+        const imageUrl = `${import.meta.env.BASE_URL}velocity_data/${layer.png}`;
         if (!ov) {
           ov = L.imageOverlay(imageUrl, layer.bounds, {
             opacity: defOpacity,
@@ -1424,7 +1438,7 @@ function App() {
         }).addTo(map);
         defHighwaysLayerRef.current = hl;
       } else {
-        fetch('/highways.geojson')
+        fetch(`${import.meta.env.BASE_URL}highways.geojson`)
           .then((res) => res.json())
           .then((data) => {
             if (mapRef.current && defShowHighways) {
@@ -1502,7 +1516,7 @@ function App() {
 
     // Fetch district boundary GeoJSON
     const filename = `${sanitizeLsmFilename(dist.state)}_${sanitizeLsmFilename(dist.district)}.json`;
-    fetch(`/districts_geo/${filename}`)
+    fetch(`${import.meta.env.BASE_URL}districts_geo/${filename}`)
       .then(res => res.json())
       .then(data => setLsmDistrictGeoJson(data))
       .catch(err => console.error("Error loading district geometry:", err));
@@ -2864,7 +2878,7 @@ function App() {
       {/* HUD HEADER */}
       <header className="hud-header">
         <div className="hud-title">
-          <img src="/logo.png" alt="PhytoLens Logo" className="hud-logo-img" />
+          <img src={`${import.meta.env.BASE_URL}logo.png`} alt="PhytoLens Logo" className="hud-logo-img" />
         </div>
 
         <div 
@@ -3913,7 +3927,7 @@ function App() {
                     {isVisible && (
                       <div className="sidebar-legend">
                         <div className="sidebar-legend-title">Scale ({scale.units})</div>
-                        <img src={`/velocity_data/data/colorbar_${l.id}.png`} alt="color scale" />
+                        <img src={`${import.meta.env.BASE_URL}velocity_data/data/colorbar_${l.id}.png`} alt="color scale" />
                         <div className="sidebar-legend-labels">
                           <span>{scale.vmin}</span><span>0</span><span>{scale.vmax}</span>
                         </div>
@@ -4849,8 +4863,11 @@ function App() {
                   : meanEt >= 4 ? { label: 'High water use', color: '#22c55e' }
                   : meanEt >= 2 ? { label: 'Moderate water use', color: '#f59e0b' }
                   : { label: 'Low water use', color: '#ef4444' };
-                const gaugeMax = 8;
-                const gaugePct = Math.max(0, Math.min(100, (meanEt / gaugeMax) * 100));
+                const gaugeMin = etSingleResult.vis_min != null ? Number(etSingleResult.vis_min) : 0;
+                const gaugeMax = etSingleResult.vis_max != null ? Number(etSingleResult.vis_max) : 8;
+                const gaugePct = gaugeMax > gaugeMin 
+                  ? Math.max(0, Math.min(100, ((meanEt - gaugeMin) / (gaugeMax - gaugeMin)) * 100))
+                  : 50;
                 // Crop coefficient interpretation.
                 const kcVal = etSingleResult.kc;
                 const kcInfo = kcVal == null ? null
@@ -4867,157 +4884,182 @@ function App() {
 
                 return (
                 <div className="glass-panel p-4 flex flex-col gap-3" style={{ maxHeight: '80vh', overflowY: 'auto' }}>
-                  <div className="results-header">
-                    <span>💧 EVAPOTRANSPIRATION (SEBAL)</span>
-                    <Droplets size={14} className="text-cyan-400" />
+                  {/* 1. Header */}
+                  <div className="flex items-center justify-between border-b border-slate-700/50 pb-3 mb-1">
+                    <div className="flex items-center gap-2">
+                      <Droplets size={20} className="text-cyan-400 fill-cyan-400/20" />
+                      <span className="text-sm font-bold tracking-wider text-white">EVAPOTRANSPIRATION (SEBAL)</span>
+                    </div>
+                    <Droplets size={16} className="text-cyan-400/50" />
                   </div>
 
-                  <div className="text-[10px] text-slate-400 flex items-center gap-2 flex-wrap">
-                    <span className="text-cyan-400 font-bold uppercase">Landsat-9</span>
-                    <span>•</span>
-                    <span className="font-mono">{etSingleResult.date}</span>
-                    {etSingleResult.cloud_cover != null && (<><span>•</span><span>{num(etSingleResult.cloud_cover).toFixed(0)}% cloud</span></>)}
+                  {/* 2. Subheader */}
+                  <div className="text-[11px] text-slate-400 flex items-center gap-3 mb-2">
+                    <div className="flex items-center gap-1.5"><Satellite size={12} className="text-cyan-400" /><span className="text-cyan-400 font-bold uppercase">LANDSAT-9</span></div>
+                    <span className="text-slate-600">|</span>
+                    <div className="flex items-center gap-1.5"><Calendar size={12} /><span>{new Date(etSingleResult.date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span></div>
+                    {etSingleResult.cloud_cover != null && (
+                      <>
+                        <span className="text-slate-600">|</span>
+                        <div className="flex items-center gap-1.5"><Cloud size={12} /><span>{num(etSingleResult.cloud_cover).toFixed(0)}% cloud</span></div>
+                      </>
+                    )}
                   </div>
 
-                  {/* Headline mean ET + intensity gauge + water volume */}
-                  <div className="p-3 rounded-lg flex flex-col gap-2 border"
-                       style={{ borderColor: etLevel.color + '55',
-                                background: 'linear-gradient(135deg, rgba(15,23,42,0.65), rgba(2,6,23,0.35))' }}>
+                  {/* 3. Mean Actual ET */}
+                  <div className="p-4 rounded-xl flex flex-col gap-3 border border-slate-700/50 bg-slate-900/40">
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: etLevel.color }}>Mean Actual ET</span>
-                      <span className="text-[9px] font-bold uppercase px-2 py-0.5 rounded-full"
-                            style={{ color: etLevel.color, background: etLevel.color + '22' }}>{etLevel.label}</span>
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-cyan-400">Mean Actual ET</span>
+                      <span className="text-[9px] font-bold uppercase px-2 py-0.5 rounded" style={{ color: etLevel.color, background: etLevel.color + '22' }}>{etLevel.label}</span>
                     </div>
                     <div className="flex items-baseline gap-1.5">
-                      <span className="text-3xl font-bold text-white font-mono leading-none">{meanEt.toFixed(2)}</span>
-                      <span className="text-xs text-slate-400">mm/day</span>
+                      <span className="text-5xl font-bold text-white leading-none">{meanEt.toFixed(2)}</span>
+                      <span className="text-sm text-slate-400">mm/day</span>
                     </div>
-                    {/* dry→wet intensity gauge with a marker at the mean */}
-                    <div className="relative w-full rounded-full mt-0.5"
-                         style={{ height: '8px', background: 'linear-gradient(90deg,#8B0000,#FF4500,#FFFF00,#00FF00,#000080)' }}>
-                      <div className="absolute rounded-sm"
-                           style={{ left: `calc(${gaugePct}% - 1.5px)`, top: '-3px', width: '3px', height: '14px',
-                                    background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.6)' }} />
+                    
+                    <div className="flex flex-col gap-1 mt-2">
+                      <div className="flex justify-between text-[10px] text-white">
+                        <span>Low</span><span>High</span>
+                      </div>
+                      <div className="relative w-full rounded-full" style={{ height: '6px', background: `linear-gradient(90deg, ${get_color_palette(etPalette).join(', ')})` }}>
+                        <div className="absolute rounded-full border-2 border-white bg-slate-200"
+                             style={{ left: `calc(${gaugePct}% - 6px)`, top: '-3px', width: '12px', height: '12px', boxShadow: '0 0 4px rgba(0,0,0,0.6)' }} />
+                      </div>
+                      <div className="flex justify-between text-[11px] text-slate-300 font-mono mt-1 relative">
+                        <span>{gaugeMin.toFixed(2)}</span>
+                        <div className="flex flex-col items-center absolute" style={{ left: `calc(${gaugePct}%)`, transform: 'translateX(-50%)', top: '10px' }}>
+                          <span className="font-bold text-[12px]" style={{ color: '#22c55e' }}>{meanEt.toFixed(2)}</span>
+                          <span className="text-[9px] text-slate-400 font-sans whitespace-nowrap">Current ET</span>
+                        </div>
+                        <span>{gaugeMax.toFixed(2)}</span>
+                      </div>
                     </div>
-                    <div className="flex justify-between text-[8px] text-slate-500 font-mono">
-                      <span>0</span><span>dry → wet</span><span>{gaugeMax} mm/day</span>
-                    </div>
-                    <div className="text-[10px] text-slate-400 pt-1.5 border-t border-slate-700/50">
+                    
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-400 mt-8 pt-3 border-t border-slate-700/50">
+                      <Droplets size={12} className="text-cyan-400" />
                       ≈ <span className="text-white font-semibold">{num(s.water_volume_m3_day).toLocaleString()}</span> m³/day over {num(s.valid_area_km2).toLocaleString()} km²
                     </div>
                   </div>
 
-                  <div className="stats-grid">
-                    <div className="stat-card">
-                      <div className="stat-label">Mean</div>
-                      <div className="stat-val high">{num(s.mean).toFixed(2)}</div>
+                  {/* 4. Stats Grid 2x2 */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 rounded-xl border border-slate-700/50 bg-slate-900/40 flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full border border-blue-500/30 flex items-center justify-center bg-blue-500/10 text-blue-400 shrink-0">
+                        <LineChart size={18} />
+                      </div>
+                      <div className="flex flex-col overflow-hidden">
+                        <span className="text-[9px] font-bold text-slate-400 tracking-wider truncate">AVERAGE</span>
+                        <span className="text-xl font-bold text-white leading-tight">{num(s.mean).toFixed(2)}</span>
+                        <span className="text-[10px] text-slate-500">mm/day</span>
+                      </div>
                     </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Std Dev</div>
-                      <div className="stat-val">{num(s.std).toFixed(2)}</div>
+                    <div className="p-3 rounded-xl border border-slate-700/50 bg-slate-900/40 flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full border border-blue-400/30 flex items-center justify-center bg-blue-400/10 text-blue-300 shrink-0">
+                        <Activity size={18} />
+                      </div>
+                      <div className="flex flex-col overflow-hidden">
+                        <span className="text-[9px] font-bold text-slate-400 tracking-wider truncate">STD. DEVIATION</span>
+                        <span className="text-xl font-bold text-white leading-tight">{num(s.std).toFixed(2)}</span>
+                        <span className="text-[10px] text-slate-500">mm/day</span>
+                      </div>
                     </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Min</div>
-                      <div className="stat-val danger">{num(s.min).toFixed(2)}</div>
+                    <div className="p-3 rounded-xl border border-slate-700/50 bg-slate-900/40 flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full border border-red-500/30 flex items-center justify-center bg-red-500/10 text-red-400 shrink-0">
+                        <ArrowDown size={18} />
+                      </div>
+                      <div className="flex flex-col overflow-hidden">
+                        <span className="text-[9px] font-bold text-slate-400 tracking-wider truncate">MINIMUM</span>
+                        <span className="text-xl font-bold text-red-400 leading-tight">{num(s.min).toFixed(2)}</span>
+                        <span className="text-[10px] text-slate-500">mm/day</span>
+                      </div>
                     </div>
-                    <div className="stat-card">
-                      <div className="stat-label">Max</div>
-                      <div className="stat-val success">{num(s.max).toFixed(2)}</div>
+                    <div className="p-3 rounded-xl border border-slate-700/50 bg-slate-900/40 flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full border border-green-500/30 flex items-center justify-center bg-green-500/10 text-green-400 shrink-0">
+                        <ArrowUp size={18} />
+                      </div>
+                      <div className="flex flex-col overflow-hidden">
+                        <span className="text-[9px] font-bold text-slate-400 tracking-wider truncate">MAXIMUM</span>
+                        <span className="text-xl font-bold text-green-400 leading-tight">{num(s.max).toFixed(2)}</span>
+                        <span className="text-[10px] text-slate-500">mm/day</span>
+                      </div>
                     </div>
                   </div>
 
-                  {/* FAO-56 reference ET0 + crop coefficient */}
+                  {/* 5. Reference ET */}
                   {etSingleResult.et0 != null && (
-                    <>
-                      <div className="lulc-section-title">Reference ET (FAO-56)</div>
-                      <div className="stats-grid">
-                        <div className="stat-card">
-                          <div className="stat-label">ET₀ (mm/day)</div>
-                          <div className="stat-val">{num(etSingleResult.et0).toFixed(2)}</div>
+                    <div className="flex flex-col gap-2 mt-1">
+                      <span className="text-[11px] font-bold text-cyan-400 tracking-wider">REFERENCE ET (FAO-56)</span>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="p-3 rounded-xl border border-slate-700/50 bg-slate-900/40 flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-full border border-blue-400/30 flex items-center justify-center bg-blue-400/10 text-blue-400 shrink-0">
+                            <Droplets size={18} className="fill-blue-400/20" />
+                          </div>
+                          <div className="flex flex-col overflow-hidden">
+                            <span className="text-[9px] font-bold text-slate-400 tracking-wider truncate">ETo (MM/DAY)</span>
+                            <span className="text-xl font-bold text-white leading-tight">{num(etSingleResult.et0).toFixed(2)}</span>
+                            <span className="text-[10px] text-slate-500">mm/day</span>
+                          </div>
                         </div>
-                        <div className="stat-card">
-                          <div className="stat-label">Kc = ETa/ET₀</div>
-                          <div className="stat-val" style={{ color: kcInfo ? kcInfo.color : undefined }}>
-                            {kcVal != null ? num(kcVal).toFixed(2) : "—"}
+                        <div className="p-3 rounded-xl border border-slate-700/50 bg-slate-900/40 flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-full border border-green-500/30 flex items-center justify-center bg-green-500/10 text-green-400 shrink-0">
+                            <Leaf size={18} />
+                          </div>
+                          <div className="flex flex-col overflow-hidden">
+                            <span className="text-[9px] font-bold text-slate-400 tracking-wider truncate">CROP COEFFICIENT (Kc)</span>
+                            <span className="text-xl font-bold text-white leading-tight">{kcVal != null ? num(kcVal).toFixed(2) : "—"}</span>
                           </div>
                         </div>
                       </div>
                       {kcInfo && (
-                        <div className="flex items-center gap-1.5 text-[10px] text-slate-400 -mt-1">
-                          <span style={{ width: 7, height: 7, borderRadius: 999, background: kcInfo.color, display: 'inline-block' }} />
-                          Crop coefficient indicates <span className="font-semibold" style={{ color: kcInfo.color }}>{kcInfo.label}</span> vs. the reference surface.
+                        <div className="flex items-start gap-2 text-[11px] text-slate-400 mt-1 px-1">
+                          <Info size={14} className="flex-shrink-0 text-cyan-500 mt-0.5" />
+                          <span>
+                            Crop coefficient (Kc = {num(kcVal).toFixed(2)}) indicates <span style={{ color: kcInfo.color }}>{kcInfo.label}</span> crop water use relative to the FAO-56 reference surface.
+                          </span>
                         </div>
                       )}
-                    </>
+                    </div>
                   )}
 
-                  {/* ET class distribution — segmented proportion bar + legend */}
+                  {/* 6. Distribution */}
                   {etSingleResult.density_bins && (
-                    <>
-                      <div className="lulc-section-title">ET Distribution (mm/day)</div>
-                      <div className="flex w-full rounded-full overflow-hidden bg-slate-800" style={{ height: '12px' }}>
+                    <div className="flex flex-col gap-2 mt-2">
+                      <span className="text-[11px] font-bold text-cyan-400 tracking-wider">ET DISTRIBUTION (MM/DAY)</span>
+                      <div className="flex w-full rounded-md overflow-hidden bg-slate-800" style={{ height: '16px' }}>
                         {distClasses.map(c => num(bins[c.key]) > 0 && (
-                          <div key={c.key} style={{ width: `${num(bins[c.key])}%`, background: c.color }}
-                               title={`${c.label}: ${num(bins[c.key])}%`} />
-                        ))}
-                      </div>
-                      <div className="grid grid-cols-2 gap-x-3 gap-y-1 mt-1">
-                        {distClasses.map(c => (
-                          <div key={c.key} className="flex items-center gap-1.5 text-[10px]">
-                            <span style={{ width: 8, height: 8, borderRadius: 2, background: c.color, display: 'inline-block', flexShrink: 0 }} />
-                            <span className="text-slate-400 flex-1 truncate">{c.label}</span>
-                            <span className="text-white font-mono">{num(bins[c.key])}%</span>
+                          <div key={c.key} className="flex items-center justify-center text-[9px] font-bold text-black/60" style={{ width: `${num(bins[c.key])}%`, background: c.color }} title={`${c.label}: ${num(bins[c.key])}%`}>
+                            {num(bins[c.key]) > 10 ? `${num(bins[c.key])}%` : ''}
                           </div>
                         ))}
                       </div>
-                    </>
-                  )}
-
-                  {/* Anchor calibration + meteorology */}
-                  <div className="lulc-section-title">SEBAL Anchors & Meteorology</div>
-                  <div className="p-3 bg-slate-900/40 rounded border border-slate-700/60 flex flex-col gap-1.5 text-[11px]">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-400">Cold / Hot anchor</span>
-                      <span className="text-white font-mono">{num(anc.T_cold_C).toFixed(1)}°C / {num(anc.T_hot_C).toFixed(1)}°C</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-400">Air temp / RH</span>
-                      <span className="text-white font-mono">{num(met.T_air_C).toFixed(1)}°C / {num(met.RH_pct).toFixed(0)}%</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-400">Wind / Rs↓</span>
-                      <span className="text-white font-mono">{num(met.wind_speed).toFixed(1)} m/s / {num(met.Rs_down).toFixed(0)} W/m²</span>
-                    </div>
-                    <div className="flex items-center justify-between text-[10px] text-slate-500 pt-1 border-t border-slate-700/60">
-                      <span>Overpass {etSingleResult.overpass_hour_utc}:00 UTC</span>
-                      <span>{num(anc.iterations)} stability iters</span>
-                    </div>
-                  </div>
-
-                  {(anc.cold_method === "relative" || anc.hot_method === "relative") && (
-                    <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 rounded flex items-start gap-2 text-amber-400">
-                      <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
-                      <span className="text-[10px] leading-normal">
-                        Anchors were auto-selected from this scene's own NDVI range (adaptive mode — it lacked pixels above the strict vegetation thresholds). Spatial ET patterns are reliable; treat absolute magnitudes with some caution.
-                      </span>
+                      <div className="grid grid-cols-4 gap-x-1 gap-y-1 mt-1">
+                        {distClasses.map(c => (
+                          <div key={c.key} className="flex flex-col items-center text-[9px]">
+                            <div className="flex items-center gap-1">
+                              <span style={{ width: 8, height: 8, borderRadius: 999, background: c.color, display: 'inline-block', flexShrink: 0 }} />
+                              <span className="text-slate-300 truncate text-center">{c.label}</span>
+                            </div>
+                            <span className="text-slate-500 font-mono mt-0.5">{num(bins[c.key])}%</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
 
-                  <div className="mt-1 pt-3 border-t border-slate-800/60 flex flex-col gap-2">
-                    <button
-                      onClick={() => renderRasterOverlay(etSingleResult.image_url, etSingleResult.bbox || [minLon, minLat, maxLon, maxLat])}
-                      className="radio-button py-2 text-xs justify-center items-center flex gap-1 border-dashed w-full"
-                    >
-                      <Eye size={14} /> View Image Overlay
+                  {/* 7. Raster Export */}
+                  <div className="flex items-center justify-between p-3 rounded-xl bg-slate-800/50 border border-slate-700/50 mt-2">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-slate-700/50 flex items-center justify-center text-slate-300 shrink-0">
+                        <Layers size={18} />
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-[11px] font-bold text-white tracking-wider">RASTER EXPORT</span>
+                        <span className="text-[10px] text-slate-400 leading-tight mt-0.5">Export evapotranspiration raster<br/>as GeoTIFF (mm/day).</span>
+                      </div>
+                    </div>
+                    <button onClick={handleEtCsvExport} className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded font-bold text-[10px] uppercase tracking-wider transition-colors shrink-0">
+                      <Download size={14} /> DOWNLOAD GEOTIFF
                     </button>
-                    <div className="flex justify-between items-center">
-                      <span className="text-[10px] text-slate-500 font-bold">
-                        Valid: {num(s.valid_pixels).toLocaleString()} px
-                      </span>
-                      <button onClick={handleEtCsvExport} className="excel-btn">
-                        Export CSV
-                      </button>
-                    </div>
                   </div>
                 </div>
                 );

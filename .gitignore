@@ -68,3 +68,9 @@ backend/static/
 !**/package.json
 !**/package-lock.json
 !frontend/public/**/*.json
+
+# Large Data Files
+aef_index.parquet
+
+# Public listing txt files
+*_public.txt
